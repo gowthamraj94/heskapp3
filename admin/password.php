@@ -1,0 +1,346 @@
+<?php
+/**
+ *
+ * This file is part of HESK - PHP Help Desk Software.
+ *
+ * (c) Copyright Klemen Stirn. All rights reserved.
+ * https://www.hesk.com
+ *
+ * For the full copyright and license agreement information visit
+ * https://www.hesk.com/eula.php
+ *
+ */
+
+define('IN_SCRIPT',1);
+define('HESK_PATH','../');
+
+/* Get all the required files and functions */
+require(HESK_PATH . 'hesk_settings.inc.php');
+require(HESK_PATH . 'inc/common.inc.php');
+
+// Is the password reset function enabled?
+if ( ! $hesk_settings['reset_pass'])
+{
+	die($hesklang['attempt']);
+}
+
+// Allow additional 5 attempts in case the user is already blocked
+$hesk_settings['attempt_limit'] += 5;
+
+$show_sent_email_message = false;
+
+// Start session
+hesk_session_start();
+
+if (!isset($_SESSION['a_iserror']))
+{
+	$_SESSION['a_iserror'] = array();
+}
+
+$hesk_error_buffer = array();
+
+// If this is a POST method, check input
+if ($_SERVER['REQUEST_METHOD'] == 'POST')
+{
+	// Verify security image
+	if ($hesk_settings['secimg_use'])
+	{
+		// Using reCAPTCHA?
+		if ($hesk_settings['recaptcha_use'])
+		{
+			require(HESK_PATH . 'inc/recaptcha/recaptchalib_v2.php');
+
+			$resp = null;
+			$reCaptcha = new ReCaptcha($hesk_settings['recaptcha_private_key']);
+
+			// Was there a reCAPTCHA response?
+			if ( isset($_POST["g-recaptcha-response"]) )
+			{
+				$resp = $reCaptcha->verifyResponse(hesk_getClientIP(), hesk_POST("g-recaptcha-response") );
+			}
+
+			if ($resp != null && $resp->success)
+			{
+				//$_SESSION['img_a_verified']=true;
+			}
+			else
+			{
+				$hesk_error_buffer['mysecnum']=$hesklang['recaptcha_error'];
+			}
+		}
+		// Using PHP generated image
+		else
+		{
+			$mysecnum = intval( hesk_POST('mysecnum', 0) );
+
+			if ( empty($mysecnum) )
+			{
+				$hesk_error_buffer['mysecnum'] = $hesklang['sec_miss'];
+			}
+			else
+			{
+				require(HESK_PATH . 'inc/secimg.inc.php');
+				$sc = new PJ_SecurityImage($hesk_settings['secimg_sum']);
+				if ( isset($_SESSION['checksum']) && $sc->checkCode($mysecnum, $_SESSION['checksum']) )
+				{
+					//$_SESSION['img_a_verified'] = true;
+                    unset($_SESSION['checksum']);
+				}
+				else
+				{
+					$hesk_error_buffer['mysecnum'] = $hesklang['sec_wrng'];
+				}
+			}
+		}
+	}
+
+	// Connect to database and check for brute force attempts
+	hesk_load_database_functions();
+	hesk_dbConnect();
+	hesk_limitBfAttempts();
+
+	// Get email
+	$email = hesk_validateEmail( hesk_POST('email'), 'ERR', 0) or $hesk_error_buffer['email']=$hesklang['enter_valid_email'];
+
+	// Any errors?
+	if (count($hesk_error_buffer)!=0)
+	{
+		$_SESSION['a_iserror'] = array_keys($hesk_error_buffer);
+
+		$tmp = '';
+		foreach ($hesk_error_buffer as $error)
+		{
+			$tmp .= "<li>$error</li>\n";
+		}
+		$hesk_error_buffer = $tmp;
+
+		$hesk_error_buffer = $hesklang['pcer'].'<br /><br /><ul>'.$hesk_error_buffer.'</ul>';
+		hesk_process_messages($hesk_error_buffer,'NOREDIRECT');
+	}
+	elseif( defined('HESK_DEMO') )
+	{
+		hesk_process_messages($hesklang['ddemo'],'NOREDIRECT');
+	}
+	else
+	{
+		// Get user data from the database
+        $res = hesk_dbQuery("SELECT `id`, `name`, `pass` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."users` WHERE `email` = '".hesk_dbEscape($email)."' AND `active` = 1 LIMIT 1");
+		if (hesk_dbNumRows($res) != 1)
+		{
+			hesk_process_messages($hesklang['noace'],'NOREDIRECT');
+		}
+		else
+		{
+			$row = hesk_dbFetchAssoc($res);
+			$reset_token = hesk_create_password_reset_token();
+			$reset_hash = hesk_hash_password_reset_token($reset_token);
+			$staff_id = intval($row['id']);
+
+			// Expire old verification hashes for this staff account
+			hesk_dbQuery("DELETE FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."reset_password` WHERE `user_type` = 'STAFF' AND `user` = {$staff_id}");
+
+			// Insert the verification hash into the database
+			hesk_dbQuery("INSERT INTO `".hesk_dbEscape($hesk_settings['db_pfix'])."reset_password` (`user`, `hash`, `ip`, `user_type`) VALUES ({$staff_id}, '".hesk_dbEscape($reset_hash)."', '".hesk_dbEscape(hesk_getClientIP())."', 'STAFF') ");
+
+			// Prepare and send email
+			require(HESK_PATH . 'inc/email_functions.inc.php');
+
+			// Get the email message
+			list($msg, $html_msg) = hesk_getEmailMessage('reset_password',array(),1,0,1);
+
+			// Replace message special tags
+            $staff_name = hesk_msgToPlain($row['name'], 1, 0);
+            list($msg, $html_msg) = hesk_replace_email_tag('%%NAME%%', $staff_name, $msg, $html_msg);
+            list($msg, $html_msg) = hesk_replace_email_tag('%%SITE_URL%%', $hesk_settings['site_url'], $msg, $html_msg);
+            list($msg, $html_msg) = hesk_replace_email_tag('%%SITE_TITLE%%', $hesk_settings['site_title'], $msg, $html_msg);
+            list($msg, $html_msg) = hesk_replace_email_tag('%%FIRST_NAME%%', hesk_full_name_to_first_name($staff_name), $msg, $html_msg);
+            list($msg, $html_msg) = hesk_replace_email_tag('%%PASSWORD_RESET%%',
+                $hesk_settings['hesk_url'].'/'.$hesk_settings['admin_dir'].'/password.php?h='.$reset_token,
+                $msg,
+                $html_msg);
+
+            // Check two additional tags (avoid a bug in 3.3.0)
+            list($msg, $html_msg) = hesk_replace_email_tag('%25%25PASSWORD_RESET%25%25',
+                $hesk_settings['hesk_url'].'/'.$hesk_settings['admin_dir'].'/password.php?h='.$reset_token,
+                $msg,
+                $html_msg);
+            list($msg, $html_msg) = hesk_replace_email_tag('%%TRACK_URL%%',
+                $hesk_settings['hesk_url'].'/'.$hesk_settings['admin_dir'].'/password.php?h='.$reset_token,
+                $msg,
+                $html_msg);
+
+			// Send email
+			hesk_mail($email, [], $hesklang['reset_password'], $msg, $html_msg);
+
+			// Show success
+            $show_sent_email_message = true;
+		}
+	}
+}
+// If the "h" parameter is set verify it and reset the password
+elseif ( isset($_GET['h']) )
+{
+	// Get the reset token and hash it for database lookup
+	$reset_token = hesk_clean_password_reset_token($_GET['h']);
+	$reset_hash = hesk_hash_password_reset_token($reset_token);
+
+	// Connect to database
+	hesk_load_database_functions();
+	hesk_dbConnect();
+
+	// Expire verification hashes older than 2 hours
+	hesk_dbQuery("DELETE FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."reset_password` WHERE `dt` < (NOW() - INTERVAL 2 HOUR)");
+
+	// Verify the hash exists
+	$res = hesk_dbQuery("SELECT `user`, `ip` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."reset_password` WHERE `hash` = '".hesk_dbEscape($reset_hash)."' AND `user_type` = 'STAFF' LIMIT 1");
+	if (hesk_dbNumRows($res) != 1)
+	{
+		// Not a valid hash
+		hesk_limitBfAttempts();
+		hesk_process_messages($hesklang['ehash'],'NOREDIRECT');
+	}
+	else
+	{
+		// Get info from database
+		$row = hesk_dbFetchAssoc($res);
+
+		// Only allow resetting password from the same IP address that submitted password reset request
+		if ($row['ip'] != hesk_getClientIP())
+		{
+			hesk_limitBfAttempts();
+			hesk_process_messages($hesklang['ehaip'],'NOREDIRECT');
+		}
+		else
+		{
+			$reset_user_id = intval($row['user']);
+
+			// Make sure the staff account still exists and is active
+			$res = hesk_dbQuery('SELECT `id`, `name`, `email` FROM `'.hesk_dbEscape($hesk_settings['db_pfix'])."users` WHERE `id` = {$reset_user_id} AND `active` = 1 LIMIT 1");
+			if (hesk_dbNumRows($res) != 1)
+			{
+				hesk_limitBfAttempts();
+				hesk_process_messages($hesklang['ehash'],'NOREDIRECT');
+			}
+			else
+			{
+				// Clean brute force attempts
+				hesk_cleanBfAttempts();
+
+				// Start a reset-only session. Do NOT create a full staff session here.
+				hesk_session_stop();
+				hesk_session_start();
+				hesk_session_regenerate_id();
+
+				$_SESSION['password_reset'] = true;
+				$_SESSION['password_reset_user_id'] = $reset_user_id;
+				$_SESSION['password_reset_hash'] = $reset_hash;
+				$_SESSION['password_reset_ip'] = hesk_getClientIP();
+				$_SESSION['password_reset_expires'] = time() + 7200;
+
+				// Redirect to the reset-only password form
+				header('Location: profile.php');
+				exit();
+			}
+
+		} // End IP matches
+	}
+}
+
+// Tell header to load reCaptcha API if needed
+if ($hesk_settings['recaptcha_use'])
+{
+	define('RECAPTCHA',1);
+}
+
+$hesk_settings['tmp_title'] = $hesk_settings['hesk_title'] . ' - ' .$hesklang['passr'];
+require_once(HESK_PATH . 'inc/header.inc.php');
+$login_wrapper = true;
+?>
+<div class="wrapper login">
+<main class="main" id="maincontent">
+    <div class="reg__wrap">
+        <div class="reg__image">
+            <div class="bg-absolute"><img src="<?php echo HESK_PATH; ?>img/hero-bg.png" alt="Hesk" /></div>
+        </div>
+        <div class="reg__section reset-password">
+            <div class="reg__box">
+                <?php if ($show_sent_email_message): ?>
+                    <h2 class="reg__heading delete">
+                        <?php echo $hesklang['password_reset_check_your_email']; ?>
+                    </h2>
+                    <div class="reset-password__text">
+                        <?php echo $hesklang['password_reset_link_sent']; ?>
+                    </div>
+                <?php else: ?>
+                    <h2 class="reg__heading delete">
+                        <?php echo $hesklang['reset_your_password']; ?>
+                    </h2>
+                    <div class="reset-password__text"><?php echo $hesklang['reset_password_instructions']; ?></div>
+                    <div style="margin-right: -24px; margin-left: -16px">
+                        <?php
+                        /* This will handle error, success and notice messages */
+                        hesk_handle_messages();
+                        ?>
+                    </div>
+                    <!-- To activate the error add the class "invalid" to the form -->
+                    <form action="password.php" class="form <?php echo isset($_SESSION['a_iserror']) && count($_SESSION['a_iserror']) ? 'invalid' : ''; ?>"
+                          method="post" name="form1" id="form1" novalidate aria-label="<?php echo $hesklang['reset_your_password']; ?>">
+                        <div class="form-group">
+                            <label for="regInputUsername"><?php echo $hesklang['email']; ?></label>
+                            <input type="email"
+                                   name="email"
+                                   class="form-control<?php echo in_array('email',$_SESSION['a_iserror']) ? ' isError' : ''; ?>"
+                                   id="regInputUsername"
+                                   placeholder="<?php echo htmlspecialchars($hesklang['enter_email']); ?>"
+                                   value="<?php if (isset($email)) {echo stripslashes(hesk_input($email));} ?>">
+                            <div class="form-control__error"><?php echo $hesklang['this_field_is_required']; ?></div>
+                        </div>
+                        <?php if ($hesk_settings['secimg_use'] && $hesk_settings['recaptcha_use'] != 1) {
+                            if ($hesk_settings['recaptcha_use'] == 2) { ?>
+                                <div class="g-recaptcha" data-sitekey="<?php echo $hesk_settings['recaptcha_public_key']; ?>"></div>
+                            <?php } else {
+                                $cls = in_array('mysecnum',$_SESSION['a_iserror']) ? ' class="form-control isError" ' : ' class="form-control" ';
+
+                                echo '<div class="form-group"><label>'.$hesklang['sec_enter'].'</label><img src="print_sec_img.php?'.rand(10000,99999).'" width="150" height="40" alt="'.$hesklang['sec_img'].'" title="'.$hesklang['sec_img'].'" border="1" name="secimg" style="vertical-align:middle" /> '.
+                                    '<a style="vertical-align: middle; display: inline" class="btn btn-refresh" href="javascript:" onclick="document.form1.secimg.src=\'print_sec_img.php?\'+ ( Math.floor((90000)*Math.random()) + 10000);">
+                                            <svg class="icon icon-refresh">
+                                                <use xlink:href="' . HESK_PATH . 'img/sprite.svg#icon-refresh"></use>
+                                            </svg>
+                                         </a>'.
+                                    '<br><br><input type="text" name="mysecnum" size="20" maxlength="5" autocomplete="off" '.$cls.'></div>';
+                            }
+                        } ?>
+                        <div class="form__submit">
+                            <button class="btn btn-full" type="submit" id="recaptcha-submit"><?php echo $hesklang['passs']; ?></button>
+                        </div>
+                        <?php
+                        // Use Invisible reCAPTCHA?
+                        if ($hesk_settings['secimg_use'] && $hesk_settings['recaptcha_use'] == 1)
+                        {
+                            ?>
+                            <div class="g-recaptcha" data-sitekey="<?php echo $hesk_settings['recaptcha_public_key']; ?>" data-bind="recaptcha-submit" data-callback="recaptcha_submitForm"></div>
+                            <?php
+                        }
+                        ?>
+                    </form>
+                <?php endif; ?>
+                <div class="reg__footer">
+                    <a href="index.php" class="link"><?php echo $hesklang['back_to_login']; ?></a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    $(() => {
+        $('form :visible[class*=isError]:first').focus();
+    })
+    </script>
+<?php
+// Clean session errors
+hesk_cleanSessionVars('a_iserror');
+hesk_cleanSessionVars('img_a_verified');
+
+// Print footer
+require_once(HESK_PATH . 'inc/footer.inc.php');
+?>
